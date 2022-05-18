@@ -1,0 +1,295 @@
+import xml.etree.cElementTree as ET
+import os
+from shapely.geometry import mapping, shape, Point
+import requests
+import json
+from shapely.geometry import *
+import matplotlib.pyplot as plt
+import os
+import time
+from mpi4py import MPI
+import sys
+import pandas as pd
+from qwikidata.entity import WikidataItem, WikidataLexeme, WikidataProperty
+from qwikidata.linked_data_interface import get_entity_dict_from_api
+from urllib.parse import urlparse
+
+
+comm = MPI.COMM_WORLD
+name = MPI.Get_processor_name()
+rank = MPI.COMM_WORLD.Get_rank()
+size = MPI.COMM_WORLD.Get_size()
+isControl = True if rank == 0 else False
+
+
+path = "lab2Data"
+pathForFiltData = "QwikiData"
+Cities = ["Kaunas","vilnius"]
+osmIDS = ["1067534","1529146"]
+
+lines = []
+total = 0
+useful = 0
+
+
+
+
+
+def printmsg(string):
+    print("[" + str(rank) + "] " + str(string))
+    sys.stdout.flush()
+
+
+if isControl:
+
+    try:
+        os.makedirs("FinalData")
+        printmsg("made FinalData dir")
+    except:
+        printmsg("FinalData dir already exits")
+
+    # give other processes cities
+    osmIDs = list()
+    
+    #osmIDs.append("435514")  # Prague
+    #osmIDs.append("2171347")  # Luxembourg
+    #osmIDs.append("34914")  # Helsinki
+    #osmIDs.append("398021")  # Stockholm
+    osmIDs.append("109166")  # Vienna
+    osmIDs.append("1067534")  # Kaunas 
+    osmIDs.append("1529146")  # vinlius   
+else:
+    osmIDs = None
+
+
+
+osmID = comm.scatter(osmIDs, root=0)
+
+filePath = "QwikiData/FilteredData_"+f"{osmID}.csv"
+
+printmsg("got city " + filePath)
+
+def getPolygonByOSMId(osmID):
+  url = "https://nominatim.openstreetmap.org/details.php?osmtype=R&osmid=" + osmID +"&class=boundary&addressdetails=1&hierarchy=0&group_hierarchy=1&format=json&polygon_geojson=1"
+  r = requests.get(url)
+  jsonResult = r.json()
+  geom = jsonResult['geometry']
+  # using shapely for polygon
+  polygon = geom
+  return polygon
+
+path = "lab2Data"
+pathForFiltData = "QwikiData"
+
+
+def boundariesSingle(poly):
+  xmin, xmax = min(poly.exterior.xy[1]), max(poly.exterior.xy[1])
+  ymin, ymax = min(poly.exterior.xy[0]), max(poly.exterior.xy[0]) 
+  
+  return (ymin, xmin, ymax, xmax)
+
+def boundariesMulti(poly):
+  p_y = []
+  p_x = []
+  for geom in poly.geoms:
+    p_x.extend(geom.exterior.xy[1])
+    p_y.extend(geom.exterior.xy[0])
+  xmin, xmax = min(p_x), max(p_x)
+  ymin, ymax = min(p_y), max(p_y) 
+  return (ymin, xmin, ymax, xmax)
+  
+def boundaries(poly):
+  polygon = shape(poly)
+  ymin,xmin,ymax,xmax = (0,0,0,0)
+  if poly['type'] == 'Polygon':
+    ymin,xmin,ymax,xmax = boundariesSingle(polygon)
+  else:
+    ymin,xmin,ymax,xmax = boundariesMulti(polygon)
+  
+  return (ymin,xmin,ymax,xmax)
+
+def blocks(poly):
+  size = 1
+  ymin,xmin,ymax,xmax = boundaries(poly)
+  xstep = (xmax-xmin)/size
+  ystep = (ymax-ymin)/size
+  bbox = []
+  for k in range(0, size):
+    for i in range(0, size):
+      bbox.append(f"{ymin+ystep*(k)},{xmin+xstep*(i)},{ymin+ystep*(k+1)},{xmin+xstep*(i+1)}")
+  return bbox
+
+
+
+
+def processWikiLink(subdomain, name, prop):
+    count = 0
+    try:
+        requestLink = requests.get(f'https://{subdomain}.wikipedia.org/w/api.php?action=query&format=json&prop={prop}&titles={name}')
+        json = requestLink.json()
+        count = len(list(json["query"]["pages"].values())[0][prop])
+        
+        return count
+    except:
+        return count
+
+
+def getInfo(filePath):
+    finalFilePath = "FinalData/UsableData_"+f"{osmID}.csv"
+    
+    df = pd.read_csv(filePath)
+    lenOfData = len(df)
+    Qwiki = df['QWikiData'].tolist()
+    hasImage = [0] * lenOfData
+    pageViewCount = [0] * lenOfData 
+    df['hasImage'] = hasImage
+    df['pageViewCount'] = pageViewCount
+    df['editsCount'] = pageViewCount
+    df['linksCount'] = pageViewCount
+    df['categoriesCount'] = pageViewCount
+    df['extlinksCount'] = pageViewCount
+    df['langlinksCount'] = pageViewCount
+    df['iwlinks'] = pageViewCount
+    df['redirects'] = pageViewCount
+    df['pageprops'] = pageViewCount
+    df['transcludedin'] = pageViewCount
+    df['fileusage'] = pageViewCount
+    df['linkshere'] = pageViewCount
+    df['templates'] = pageViewCount
+    df['hasVideo'] = pageViewCount
+    pageview = 0
+    for QwikiID in Qwiki:
+        try:
+            id = df.index[df['QWikiData'] == QwikiID]
+            q42_dict = get_entity_dict_from_api(QwikiID)
+            df.loc[id,'hasImage'] = int("P18" in q42_dict["claims"])
+            df.loc[id,'hasVideo'] = int("P10" in q42_dict["claims"])
+            wiki_urls = {}
+            pageview = 0
+            index = 0
+            for key, sitelink in q42_dict['sitelinks'].items():
+                if(index > 10):
+                    break
+                index += 1
+                wiki_url = sitelink.get('url')
+                subdomain = urlparse(wiki_url).hostname.split('.')[0]
+                name = (sitelink.get('url').split('/')[-1])
+                try:
+                    response = requests.get(f'https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{subdomain}.wikipedia/all-access/user/{name}/monthly/2022020100/2022030100', headers = {'User-agent': 'Mozilla/5.0'})
+                    resp = response.json()
+                    pageview += resp['items'][0]['views']
+                except:
+                    None
+            df.loc[id,'pageViewCount'] = pageview
+            
+            response = requests.get(f'https://wikimedia.org/api/rest_v1/metrics/edits/per-page/mediawiki/{name}/all-editor-types/monthly/20220401/20220501')
+            resp = response.json()
+            editsCount = resp['items'][0]['results'][0]['edits']
+
+            linksCount = processWikiLink(subdomain, name, "links")
+            categoriesCount = processWikiLink(subdomain, name, "categories")
+            extlinksCount = processWikiLink(subdomain, name, "extlinks")
+            langlinksCount = processWikiLink(subdomain, name, "langlinks")
+            iwlinks = processWikiLink(subdomain, name, "iwlinks")
+            redirects = processWikiLink(subdomain, name, "redirects")
+            pageprops = processWikiLink(subdomain, name, "pageprops")
+            transcludedin = processWikiLink(subdomain, name, "transcludedin")
+            wbentityusage = processWikiLink(subdomain, name, "wbentityusage")
+            fileusage = processWikiLink(subdomain, name, "fileusage")
+            linkshere = processWikiLink(subdomain, name, "linkshere")
+            templates = processWikiLink(subdomain, name, "templates")
+
+          
+          
+
+            df.loc[id,'editsCount'] = editsCount
+            df.loc[id,'linksCount'] = linksCount
+            df.loc[id,'categoriesCount'] = categoriesCount
+            df.loc[id,'extlinksCount'] = extlinksCount
+            df.loc[id,'langlinksCount'] = langlinksCount
+            df.loc[id,'iwlinks'] = iwlinks
+            df.loc[id,'redirects'] = redirects
+            df.loc[id,'pageprops'] = pageprops
+            df.loc[id,'transcludedin'] = transcludedin
+            df.loc[id,'wbentityusage'] = wbentityusage
+            df.loc[id,'fileusage '] = fileusage 
+            df.loc[id,'linkshere'] = linkshere
+            df.loc[id,'templates'] = templates
+
+        except:
+            None
+            printmsg("Kapiec...")
+    df.to_csv("FinalData/UsableData_"+f"{osmID}.csv")
+    return finalFilePath
+
+
+
+printmsg("got city " + osmID)
+
+
+def getQwikiCodes(osmID):
+  lines = []
+  total = 0
+  useful = 0
+  filePath = path+f"/{osmID}.xml"
+  polygon = shape(getPolygonByOSMId(osmID))
+  dataLine =""
+  ########################################################################################
+
+  bbox = blocks(getPolygonByOSMId(osmID))
+  print(bbox)
+  url=""
+  for box in bbox:
+      url = f"https://overpass-api.de/api/map?bbox={box}"
+  req = requests.get(url)
+  
+  #######################################################################################3
+  tree =  ET.ElementTree(ET.fromstring(req.content))
+  root = tree.getroot()
+  content = ""
+  for node in root.iter('node'):
+          if(useful>1):
+            break
+          print(useful)
+          if (polygon.contains(Point(float(node.attrib['lon']), float(node.attrib['lat'])))):
+            for tag in node.iter('tag'):
+              if(tag.attrib['k'] == 'shop' or tag.attrib['k'] == 'religion' or tag.attrib['k'] == 'tourism' or tag.attrib['k'] == 'amenity'):
+                for tag2 in node.iter('tag'):
+                  if( tag2.attrib['k']=="brand:wikidata"):
+                    dataLine = f"{tag2.attrib['v']},{osmID},{Cities[osmIDS.index(osmID)]},{node.attrib['lat']},{node.attrib['lon']},{1},{0},{0},{0}"
+                    lines.append(dataLine)
+                    useful = useful + 1
+                    print("papliusinau")
+            
+  data = list(dict.fromkeys(lines)) 
+  outputFilePath = pathForFiltData+"/FilteredData_"+f"{osmID}.csv"
+  OutputFile = open(outputFilePath, "w")
+  for single in data:
+    OutputFile.write(single+"\n")
+  OutputFile.close()
+  df = pd.read_csv(outputFilePath, sep="," , names=["QWikiData", "osmID", "City", "lat","lon","isShop","isReligion","isTourism", "isAmenity"])
+  df.drop_duplicates(subset=['QWikiData'],inplace=True)
+  useful = len(df)
+  print("Total number of lines: ", total)
+  print("Useful number of lines: ", useful)
+  df.to_csv(outputFilePath)
+  return outputFilePath
+
+
+
+
+outputFilePath1 = getQwikiCodes(osmID)
+
+printmsg("Baigtas: " + outputFilePath1)
+
+outputFilePath = getInfo(filePath)
+
+printmsg("Baigtas: " + osmID)
+
+filePaths = comm.gather(outputFilePath, root=0)
+if rank == 0:
+    printmsg( filePaths )
+
+
+
+
